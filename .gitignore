@@ -1,0 +1,15 @@
+# uv & virtualenv
+.venv/
+uv.lock
+
+# python junk
+__pycache__/
+*.py[cod]
+
+# macos/system
+.DS_Store
+.idea/
+.vscode/
+
+# local logs
+*.log
