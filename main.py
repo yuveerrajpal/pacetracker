@@ -1,67 +1,73 @@
 import requests
 
-# gurgaon coords
+
+# coordinates
 LAT = 28.4595
 LON = 77.0266
 
 
 class PaceAdjuster:
-    def __init__(self, temp, humidity, uv_index, wind_speed, is_acc=True):
+    def __init__(self, temp, humidity, dew_point, uv_index, wind_speed, is_acc=True):
         self.temp = temp
         self.humidity = humidity
+        self.dew_point = dew_point
         self.uv = uv_index
         self.wind_speed = wind_speed
         self.is_acc = is_acc
 
-    def calculate_wbgt_approx(self):
-        # 0.7*WetBulb + 0.2*BlackGlobe + 0.1*DryBulb
-        rh_factor = self.humidity / 100
-        wbgt = (0.567 * self.temp) + (0.399 * self.temp * rh_factor) + 3.94
+    def calculate_heat_stress_score(self):
 
-        # solar radiation
-        wbgt += (self.uv * 0.6)
+        base_stress = self.temp + (self.dew_point * 0.5)
 
-        # wind cools
-        wbgt -= (self.wind_speed * 0.15)
 
-        return wbgt
+        base_stress += (self.uv * 0.5)
+
+
+        base_stress -= (self.wind_speed * 0.15)
+        return base_stress
 
     def adjust_pace(self, base_pace_seconds):
-        wbgt = self.calculate_wbgt_approx()
-        if wbgt <= 18:
+        stress = self.calculate_heat_stress_score()
+
+
+        if stress <= 20:
             return base_pace_seconds, 0
 
-        # penalty is way lower if you're used to gurugram heat
-        penalty_rate = 0.011 if self.is_acc else 0.018
 
-        degradation_factor = 1 + (wbgt - 18) * penalty_rate
+        penalty_rate = 0.008 if self.is_acc else 0.015
+
+        degradation_factor = 1 + (stress - 20) * penalty_rate
         return base_pace_seconds * degradation_factor, (degradation_factor - 1) * 100
 
     def dehydration_risk(self, distance_km, pace_seconds):
         duration_hours = (distance_km * pace_seconds) / 3600
 
-        # wind increases evap. rate
-        sweat_rate = 0.6 + (self.temp * 0.025) + (self.humidity * 0.008) + (self.wind_speed * 0.005)
+
+        sweat_rate = 0.5 + (self.temp * 0.02) + (self.dew_point * 0.015)
+
+
+        sweat_rate = min(2.5, sweat_rate)
 
         total_fluid = sweat_rate * duration_hours
-        risk_score = min(10, (sweat_rate * 3.5) + (self.uv / 2))
+        risk_score = min(10, (sweat_rate * 3.0) + (self.uv * 0.4))
         return total_fluid, risk_score, duration_hours
 
     def get_hr_drift(self, hours, base_hr):
-        wbgt = self.calculate_wbgt_approx()
+        stress = self.calculate_heat_stress_score()
 
-        # default 2% drift just from running
-        drift = 0.02
 
-        # heat spikes hr over time
-        if wbgt > 15:
-            drift += (wbgt - 15) * 0.005 * hours
+        drift = 0.02 * hours
 
-        # less drift if heat adapted
+
+        if stress > 25:
+            drift += (stress - 25) * 0.004 * hours
+
         if self.is_acc:
-            drift *= 0.75
+            drift *= 0.80
 
-        return base_hr * (1 + drift)
+        final_hr = base_hr * (1 + drift)
+        decoupling_pct = drift * 100
+        return final_hr, decoupling_pct
 
 
 def format_pace(seconds):
@@ -73,45 +79,64 @@ def main():
     params = {
         "latitude": LAT,
         "longitude": LON,
-        "current": "temperature_2m,relative_humidity_2m,uv_index,wind_speed_10m",
+        "current": "temperature_2m,relative_humidity_2m,dew_point_2m,uv_index,wind_speed_10m",
         "timezone": "auto"
     }
 
     try:
+        print("fetching localized weather telemetry...")
         response = requests.get(url, params=params).json()
         current = response['current']
         t = current['temperature_2m']
         h = current['relative_humidity_2m']
+        dp = current['dew_point_2m']
         uv = current['uv_index']
         wind = current['wind_speed_10m']
 
-        print(f"--- Gurugram Live: {t}°C | {h}% Humidity | UV: {uv} | Wind: {wind}km/h ---")
+        print(f"\n--- CONDITIONS: {t}°C | Dew Point: {dp}°C | UV: {uv} | Wind: {wind}km/h ---")
 
-        # 2. Input
-        dist = float(input("distance (km): "))
-        p_min = float(input("target pace (min): "))
-        p_sec = float(input("target pace (sec): "))
-        hr = float(input("target HR (e.g. 145): "))
-        acc_in = input("used to the heat? (y/n): ")
+        # 2. Input with Smart Defaults
+        dist_in = input("distance (km) [default 5.0]: ")
+        dist = float(dist_in) if dist_in else 5.0
 
-        is_acc = True if acc_in.lower() == 'y' else False
+        p_min_in = input("target pace (min) [default 5]: ")
+        p_min = float(p_min_in) if p_min_in else 5.0
+
+        p_sec_in = input("target pace (sec) [default 54]: ")
+        p_sec = float(p_sec_in) if p_sec_in else 30.0
+
+        hr_in = input("target HR (e.g. 145) [default 145]: ")
+        hr = float(hr_in) if hr_in else 145.0
+
+        acc_in = input("heat adapted? (y/n) [default y]: ")
+        is_acc = False if acc_in.lower() == 'n' else True
+
         base_sec = (p_min * 60) + p_sec
 
-        runner = PaceAdjuster(t, h, uv, wind, is_acc)
+        # 3. Execution
+        runner = PaceAdjuster(t, h, dp, uv, wind, is_acc)
 
         adj_pace, penalty = runner.adjust_pace(base_sec)
         fluid, risk, hours = runner.dehydration_risk(dist, adj_pace)
-        final_hr = runner.get_hr_drift(hours, hr)
+        final_hr, decoupling = runner.get_hr_drift(hours, hr)
 
-        print("\n" + "=" * 30)
-        print(f"adjusted pace: {format_pace(adj_pace)}/km (+{penalty:.1f}%)")
-        print(f"end-run HR:    ~{int(final_hr)} BPM")
-        print(f"water needed:  {fluid:.2f} Liters")
-        print(f"thermal risk:  {risk:.1f}/10")
-        print("=" * 30)
+        print("\n" + "=" * 35)
+        print(f"ADJUSTED PACE: {format_pace(adj_pace)}/km (+{penalty:.1f}%)")
+        print(f"WATER NEEDED:  {fluid:.2f} Liters")
+        print(f"THERMAL RISK:  {risk:.1f}/10")
+        print("-" * 35)
+        print(f"END-RUN HR:    ~{int(final_hr)} BPM")
+
+
+        if decoupling > 5.0:
+            print(f">> ALERT: {decoupling:.1f}% Aerobic Decoupling.")
+            print(">> you will likely cross out of your target HR zone.")
+        else:
+            print(f">> HR Drift stable at {decoupling:.1f}%.")
+        print("=" * 35)
 
     except Exception as e:
-        print(f"error fetching weather: {e}")
+        print(f"Error fetching weather: {e}")
 
 
 if __name__ == "__main__":
